@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "csapp.h"
 #include "sbuf.h"
+#include "cache.h"
 
 
 /* Recommended max cache and object sizes */
@@ -9,6 +10,7 @@
 #define WEB_PREFIX "http://"
 #define NTHREADS  4
 #define SBUFSIZE  16
+#define CR "\r\n"
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
@@ -25,7 +27,9 @@ void parseLine(char *, char *, char *, char *, char *, char *, char *);
 
 void *thread(void *vargp);
 
-sbuf_t sbuf; /* Shared buffer of connected descriptors */
+void readAndWriteResponse(int, rio_t *, char *uri);
+
+static sbuf_t sbuf; /* Shared buffer of connected descriptors */
 
 int main(int argc, char **argv) {
     int listenfd, connfd;
@@ -45,6 +49,9 @@ int main(int argc, char **argv) {
     sbuf_init(&sbuf, SBUFSIZE);
     for (int i = 0; i < NTHREADS; i++)  /* Create worker threads */
         Pthread_create(&tid, NULL, thread, NULL);
+
+    /* initialize the cache */
+    initializeCache(&cache);
 
     while (1) {
         clientlen = sizeof(clientaddr);
@@ -99,8 +106,18 @@ void handleRequest(int fd) {
         return;
     }
 
-    int rv = readAndFormatRequestHeader(&rio, clientRequest, host, port, method, uri, version, fileName);
-    if (rv == 0) { // bad request, ignore it
+    int rv1 = readAndFormatRequestHeader(&rio, clientRequest, host, port, method, uri, version, fileName);
+    if (rv1 == 0) { // bad request, ignore it
+        return;
+    }
+
+    obj_t *rv = readItem(uri, fd);
+    if (rv != NULL) { // we send it using cache
+        printf("======we are using cache to send the response back ====\n");
+
+        Rio_writen(fd, rv->respHeader, rv->respHeaderLen);
+        Rio_writen(fd, CR, strlen(CR));
+        Rio_writen(fd, rv->respBody, rv->respBodyLen);
         return;
     }
 
@@ -114,22 +131,74 @@ void handleRequest(int fd) {
     char hostName[100];
     char *colon = strstr(host, ":");
     strncpy(hostName, host, colon - host);
-    printf("host is %s\n", hostName);
-    printf("port is %s\n", port);
+//    printf("host is %s\n", hostName);
+//    printf("port is %s\n", port);
     int clientfd = Open_clientfd(hostName, port);
 
     Rio_readinitb(&rioTiny, clientfd);
     Rio_writen(rioTiny.rio_fd, clientRequest, strlen(clientRequest));
 
     /** step4: read the response from tiny and send it to the client */
-    printf("---prepare to get the response---- \n");
-    char tinyResponse[MAXLINE];
+//    printf("---prepare to get the response---- \n");
+//    char tinyResponse[MAXLINE];
+//    int n;
+//    while ((n = Rio_readnb(&rioTiny, tinyResponse, MAXLINE)) != 0) {
+//        Rio_writen(fd, tinyResponse, n);
+//    }
 
-    int n;
-    while ((n = Rio_readnb(&rioTiny, tinyResponse, MAXLINE)) != 0) {
-        Rio_writen(fd, tinyResponse, n);
-    }
+    readAndWriteResponse(fd, &rioTiny, uri);
 }
+
+void readAndWriteResponse(int fd, rio_t *rioTiny, char *uri) {
+    char tinyResponse[MAXLINE];
+    int n, totalBytes = 0;
+    //new response
+    obj_t *obj = Malloc(sizeof(*obj));
+    obj->flag = '0';
+    strcpy(obj->uri, uri);
+    *obj->respHeader = 0;
+    *obj->respBody = 0;
+
+    printf("obj->url == %s\n", obj->uri);
+
+    while ((n = rio_readlineb(rioTiny, tinyResponse, MAXLINE)) != 0) {
+        Rio_writen(fd, tinyResponse, n);
+
+        // https://developer.mozilla.org/en-US/docs/Web/HTTP/Messages
+        if (strcmp(tinyResponse, "\r\n") == 0) // prepare for body part
+            break;
+
+        strcat(obj->respHeader, tinyResponse);
+        totalBytes += n;
+    }
+
+    obj->respHeaderLen = totalBytes;
+    totalBytes = 0;
+
+    while ((n = rio_readlineb(rioTiny, tinyResponse, MAXLINE)) != 0) {
+        Rio_writen(fd, tinyResponse, n);
+        totalBytes += n;
+        strcat(obj->respBody, tinyResponse);
+    }
+
+    obj->respBodyLen = totalBytes;
+    //check if the cache is too large
+    if (totalBytes >= MAX_OBJECT_SIZE) {
+        Free(obj);
+        return;
+    }
+
+//    printf("In reading Responsse, we have cache the follwing item\n");
+//    printf("======= response header ========\n");
+//    printf("%s", obj->respHeader);
+//    printf("======= response body ==========\n");
+//    printf("%s", obj->respBody);
+
+    /* try to read current capacity and write into it */
+    writeToCache(obj);
+//    printf("=======writng this object in to cache=========\n");
+}
+
 
 void replaceHTTPVersion(char *buf) {
     char *pos = NULL;
